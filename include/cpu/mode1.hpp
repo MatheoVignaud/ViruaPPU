@@ -489,27 +489,86 @@ static inline void CompositeLineMode0(int line, uint32_t bgLayers[BG_COUNT][GBA_
                 bgOrder[j] = t;
             }
 
+    // ---- Window support ---------------------------------------------------
+    // WIN0/WIN1 control per-pixel layer visibility and SFX enable.
+    bool win0On = (dispcnt & DISP_WIN0_ON) != 0;
+    bool win1On = (dispcnt & DISP_WIN1_ON) != 0;
+    bool anyWin = win0On || win1On;
+
+    uint16_t winin = IoRead16(IO_WININ);
+    uint16_t winout = IoRead16(IO_WINOUT);
+
+    // Window 0 horizontal/vertical bounds
+    uint16_t win0h = IoRead16(IO_WIN0H);
+    uint16_t win0v = IoRead16(IO_WIN0V);
+    int w0l = win0h >> 8, w0r = win0h & 0xFF;
+    int w0t = win0v >> 8, w0b = win0v & 0xFF;
+    if (w0r > 240)
+        w0r = 240;
+    if (w0b > 160)
+        w0b = 160;
+    // Handle horizontal wrap-around: if left > right, window wraps (0..right, left..240)
+    bool w0hWrap = (w0l > w0r);
+    bool w0vActive = win0On && (w0t <= w0b) && (line >= w0t) && (line < w0b);
+
+    // Window 1 horizontal/vertical bounds
+    uint16_t win1h = IoRead16(IO_WIN1H);
+    uint16_t win1v = IoRead16(IO_WIN1V);
+    int w1l = win1h >> 8, w1r = win1h & 0xFF;
+    int w1t = win1v >> 8, w1b = win1v & 0xFF;
+    if (w1r > 240)
+        w1r = 240;
+    if (w1b > 160)
+        w1b = 160;
+    bool w1hWrap = (w1l > w1r);
+    bool w1vActive = win1On && (w1t <= w1b) && (line >= w1t) && (line < w1b);
+
+    uint8_t win0Ctrl = winin & 0x3F;
+    uint8_t win1Ctrl = (winin >> 8) & 0x3F;
+    uint8_t wonCtrl = winout & 0x3F;
+
     for (int x = 0; x < GBA_WIDTH; ++x) {
+        // Determine per-pixel window control bits (BG0-3 enable, OBJ enable, SFX enable)
+        uint8_t winCtrl = 0x3F; // no windowing: everything enabled
+        if (anyWin) {
+            winCtrl = wonCtrl; // default: outside all windows
+            // WIN1 checked first — WIN0 has higher priority and overrides
+            if (w1vActive) {
+                bool inH = w1hWrap ? (x >= w1l || x < w1r) : (x >= w1l && x < w1r);
+                if (inH)
+                    winCtrl = win1Ctrl;
+            }
+            if (w0vActive) {
+                bool inH = w0hWrap ? (x >= w0l || x < w0r) : (x >= w0l && x < w0r);
+                if (inH)
+                    winCtrl = win0Ctrl;
+            }
+        }
+
+        bool winBgVis[4] = {
+            (winCtrl & 0x01) != 0,
+            (winCtrl & 0x02) != 0,
+            (winCtrl & 0x04) != 0,
+            (winCtrl & 0x08) != 0,
+        };
+        bool winObjVis = (winCtrl & 0x10) != 0;
+        bool winSfx = (winCtrl & 0x20) != 0;
+
         // Build a sorted list of visible pixels at this column.
-        // Each entry: {color, priority, layerId (0-3=BG, 4=OBJ, 5=BD)}
-        // We want the top pixel and the second-from-top for alpha blending.
         uint32_t topColor = bdColor;
         int topLayerId = 5; // backdrop
         uint32_t botColor = bdColor;
         int botLayerId = 5;
 
-        // Find topmost and second-topmost pixel.
-        // Iterate priority levels 0..3. Within each, check BGs by order, then OBJ.
         bool foundTop = false;
         bool foundBot = false;
 
         for (int pri = 0; pri <= 3 && !foundBot; ++pri) {
-            // On GBA, OBJ with priority P is drawn IN FRONT of BGs with priority P.
-            // Check OBJ at this priority FIRST.
-            if (objEnabled && objLayer[x] != 0 && objPri[x] == pri) {
+            // OBJ with priority P is drawn IN FRONT of BGs with priority P.
+            if (objEnabled && winObjVis && objLayer[x] != 0 && objPri[x] == pri) {
                 if (!foundTop) {
                     topColor = objLayer[x];
-                    topLayerId = 4; // OBJ
+                    topLayerId = 4;
                     foundTop = true;
                 } else if (!foundBot) {
                     botColor = objLayer[x];
@@ -518,10 +577,9 @@ static inline void CompositeLineMode0(int line, uint32_t bgLayers[BG_COUNT][GBA_
                 }
             }
 
-            // Then check BGs at this priority
             for (int k = 0; k < 4; ++k) {
                 int bg = bgOrder[k];
-                if (!bgEnabled[bg])
+                if (!bgEnabled[bg] || !winBgVis[bg])
                     continue;
                 if (bgPriority[bg] != pri)
                     continue;
@@ -541,35 +599,29 @@ static inline void CompositeLineMode0(int line, uint32_t bgLayers[BG_COUNT][GBA_
             }
         }
 
-        // Apply blend effects
+        // Apply blend effects (uniquement lorsque les SFX sont activés pour la fenetre)
         uint32_t pixel = topColor;
 
-        switch (effect) {
-            case BLEND_ALPHA:
-                // Alpha blend only if top is 1st target and bot is 2nd target
-                if (IsFirstTarget(bldcnt, topLayerId) && IsSecondTarget(bldcnt, botLayerId)) {
-                    pixel = AlphaBlend(topColor, botColor, eva, evb);
-                }
-                break;
-            case BLEND_BRIGHTEN:
-                if (IsFirstTarget(bldcnt, topLayerId)) {
-                    pixel = BrightenPixel(topColor, evy);
-                }
-                break;
-            case BLEND_DARKEN:
-                if (IsFirstTarget(bldcnt, topLayerId)) {
-                    pixel = DarkenPixel(topColor, evy);
-                }
-                break;
-            default:
-                break;
-        }
-
-        // OBJ with semi-transparent mode (objMode == 1) forces alpha blend
-        // regardless of BLDCNT 1st target setting
-        if (objEnabled && objLayer[x] != 0 && topLayerId == 4) {
-            // Check if this OBJ has semi-transparent mode
-            // We'd need the OAM attr0 objMode — for now, handled by BLDCNT
+        if (winSfx) {
+            switch (effect) {
+                case BLEND_ALPHA:
+                    if (IsFirstTarget(bldcnt, topLayerId) && IsSecondTarget(bldcnt, botLayerId)) {
+                        pixel = AlphaBlend(topColor, botColor, eva, evb);
+                    }
+                    break;
+                case BLEND_BRIGHTEN:
+                    if (IsFirstTarget(bldcnt, topLayerId)) {
+                        pixel = BrightenPixel(topColor, evy);
+                    }
+                    break;
+                case BLEND_DARKEN:
+                    if (IsFirstTarget(bldcnt, topLayerId)) {
+                        pixel = DarkenPixel(topColor, evy);
+                    }
+                    break;
+                default:
+                    break;
+            }
         }
 
         frame_buffer[line * GBA_WIDTH + x] = pixel;
