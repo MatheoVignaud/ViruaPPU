@@ -19,6 +19,9 @@ void RenderFrame() {
         case 2:
             Mode2::RenderFrame(global_Registers);
             break;
+        case 7:
+            Mode7::RenderFrame(global_Registers);
+            break;
         default:
             break;
     }

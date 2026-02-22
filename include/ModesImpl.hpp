@@ -8,4 +8,5 @@
 #include "cpu/mode0.hpp"
 #include "cpu/mode1.hpp"
 #include "cpu/mode2.hpp"
+#include "cpu/mode7.hpp"
 #endif
